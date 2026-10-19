@@ -1,4 +1,6 @@
 metaapi-cloud-sdk
-google-genai
+python-telegram-bot==20.7
 python-dotenv
+pytz
 requests
+google-generativeai
