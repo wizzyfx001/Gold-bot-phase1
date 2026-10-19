@@ -1,0 +1,4 @@
+metaapi-cloud-sdk
+google-generativeai
+python-dotenv
+requests
