@@ -1,10 +1,20 @@
 """
 WIZZY AUTONOMOUS TRADING BOT
-STAGE 2 - MULTI-SYMBOL SCANNER
+STAGE 2.1 - EURUSD MARKET DATA TEST
 
-Railway + MetaApi + MT5 + Telegram
+Platform:
+GitHub + Railway + MetaApi + MT5 + Telegram
 
-No trade execution in this stage.
+Purpose:
+- Connect to MetaApi
+- Verify MT5 account connection
+- Find EURUSD broker symbol
+- Retrieve H1 and M15 candles
+- Calculate ATR and market trend
+- Send Telegram reports
+
+IMPORTANT:
+No trade execution.
 """
 
 import os
@@ -22,18 +32,19 @@ from telegram import Bot
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = [
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "AUDUSD",
-    "XAUUSD"
-]
+SYMBOLS = ["EURUSD"]
 
 SCAN_INTERVAL = 300
+CANDLE_LIMIT = 60
+
+
+# =====================================
+# LOGGING
+# =====================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +53,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("WIZZY")
 
+# Reduce noisy MetaApi websocket logs.
+logging.getLogger("socketio").setLevel(logging.WARNING)
+logging.getLogger("engineio").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 # =====================================
 # TELEGRAM
@@ -49,7 +65,7 @@ logger = logging.getLogger("WIZZY")
 
 async def send_message(message):
 
-    print(message, flush=True)
+    logger.info("%s", message)
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.warning("Telegram credentials missing")
@@ -59,11 +75,14 @@ async def send_message(message):
         async with Bot(token=TELEGRAM_TOKEN) as bot:
             await bot.send_message(
                 chat_id=CHAT_ID,
-                text=message[:4000]
+                text=message[:3900]
             )
 
     except Exception as error:
-        logger.error("Telegram error: %s", error)
+        logger.error(
+            "Telegram notification failed: %s",
+            error
+        )
 
 
 # =====================================
@@ -76,11 +95,16 @@ async def connect_account():
 
     api = MetaApi(METAAPI_TOKEN)
 
-    account = await api.metatrader_account_api.get_account(
-        ACCOUNT_ID
+    account = await (
+        api.metatrader_account_api.get_account(
+            ACCOUNT_ID
+        )
     )
 
     if account.state != "DEPLOYED":
+
+        logger.info("Deploying MetaApi account...")
+
         await account.deploy()
         await account.wait_deployed()
 
@@ -91,16 +115,16 @@ async def connect_account():
     await connection.connect()
     await connection.wait_synchronized()
 
-    logger.info("MetaApi connection successful")
+    logger.info("MetaApi connection established")
 
     return account, connection
 
 
 # =====================================
-# CANDLE HELPERS
+# DATA HELPERS
 # =====================================
 
-def value(obj, key):
+def get_value(obj, key):
 
     if isinstance(obj, dict):
         return obj.get(key)
@@ -111,52 +135,85 @@ def value(obj, key):
 def parse_time(raw):
 
     if isinstance(raw, datetime):
-        dt = raw
+        result = raw
 
     elif isinstance(raw, str):
-        dt = datetime.fromisoformat(
-            raw.replace("Z", "+00:00")
-        )
+
+        try:
+            result = datetime.fromisoformat(
+                raw.replace("Z", "+00:00")
+            )
+
+        except ValueError:
+            return None
 
     else:
         return None
 
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    if result.tzinfo is None:
+        result = result.replace(
+            tzinfo=timezone.utc
+        )
 
-    return dt.astimezone(timezone.utc)
+    return result.astimezone(timezone.utc)
 
 
-def clean_candles(raw):
+def clean_candles(raw, timeframe_minutes):
+
+    now = datetime.now(timezone.utc)
 
     candles = []
 
-    for c in raw:
+    for candle in raw:
 
         try:
-            t = parse_time(value(c, "time"))
 
-            if t is None:
+            timestamp = parse_time(
+                get_value(candle, "time")
+            )
+
+            if timestamp is None:
+                continue
+
+            o = float(get_value(candle, "open"))
+            h = float(get_value(candle, "high"))
+            l = float(get_value(candle, "low"))
+            c = float(get_value(candle, "close"))
+
+            if not (
+                l <= min(o, c)
+                and max(o, c) <= h
+            ):
+                continue
+
+            # Ignore unfinished candles.
+            close_time = timestamp + timedelta(
+                minutes=timeframe_minutes
+            )
+
+            if close_time > now:
                 continue
 
             candles.append({
-                "time": t,
-                "open": float(value(c, "open")),
-                "high": float(value(c, "high")),
-                "low": float(value(c, "low")),
-                "close": float(value(c, "close"))
+                "time": timestamp,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c
             })
 
         except (TypeError, ValueError):
             continue
 
-    candles.sort(key=lambda x: x["time"])
+    candles.sort(
+        key=lambda item: item["time"]
+    )
 
     return candles
 
 
 # =====================================
-# ATR
+# ATR CALCULATION
 # =====================================
 
 def calculate_atr(candles, period=14):
@@ -166,68 +223,73 @@ def calculate_atr(candles, period=14):
 
     ranges = []
 
-    for i in range(1, len(candles)):
+    for index in range(1, len(candles)):
 
-        current = candles[i]
-        previous = candles[i - 1]
+        current = candles[index]
+        previous = candles[index - 1]
 
-        tr = max(
+        true_range = max(
             current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
+            abs(
+                current["high"] -
+                previous["close"]
+            ),
+            abs(
+                current["low"] -
+                previous["close"]
+            )
         )
 
-        ranges.append(tr)
+        ranges.append(true_range)
 
-    return sum(ranges[-period:]) / period
+    return sum(
+        ranges[-period:]
+    ) / period
 
 
 # =====================================
 # SYMBOL RESOLVER
 # =====================================
 
-async def resolve_symbols(connection):
+async def resolve_eurusd(connection):
 
     available = await connection.get_symbols()
 
-    available = [str(s) for s in available]
+    names = [
+        str(symbol)
+        for symbol in available
+    ]
 
-    resolved = {}
+    exact = [
+        symbol
+        for symbol in names
+        if symbol.upper() == "EURUSD"
+    ]
 
-    for wanted in SYMBOLS:
+    if exact:
+        return exact[0]
 
-        exact = [
-            s for s in available
-            if s.upper() == wanted
-        ]
+    matches = [
+        symbol
+        for symbol in names
+        if (
+            symbol.upper().startswith("EURUSD")
+            and len(symbol) <= 10
+        )
+    ]
 
-        if exact:
-            resolved[wanted] = exact[0]
-            continue
+    if len(matches) == 1:
+        return matches[0]
 
-        suffix_matches = [
-            s for s in available
-            if s.upper().startswith(wanted)
-            and len(s) - len(wanted) <= 4
-        ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Multiple EURUSD symbol matches: "
+            + ", ".join(matches)
+        )
 
-        if len(suffix_matches) == 1:
-            resolved[wanted] = suffix_matches[0]
-
-        elif len(suffix_matches) > 1:
-            logger.warning(
-                "%s has multiple matches: %s",
-                wanted,
-                suffix_matches
-            )
-
-        else:
-            logger.warning(
-                "Symbol unavailable: %s",
-                wanted
-            )
-
-    return resolved
+    raise RuntimeError(
+        "EURUSD symbol not found on broker"
+    )
 
 
 # =====================================
@@ -236,27 +298,16 @@ async def resolve_symbols(connection):
 
 def analyze_market(h1, m15):
 
-    if len(h1) < 50 or len(m15) < 20:
-        return None
+    if len(h1) < 50:
+        return None, "Insufficient H1 candles"
 
-    # Use completed candles only.
+    if len(m15) < 20:
+        return None, "Insufficient M15 candles"
 
-    now = datetime.now(timezone.utc)
-
-    h1 = [
-        c for c in h1
-        if c["time"] + timedelta(hours=1) <= now
+    closes = [
+        candle["close"]
+        for candle in h1
     ]
-
-    m15 = [
-        c for c in m15
-        if c["time"] + timedelta(minutes=15) <= now
-    ]
-
-    if len(h1) < 50 or len(m15) < 20:
-        return None
-
-    closes = [c["close"] for c in h1]
 
     sma20 = sum(closes[-20:]) / 20
     sma50 = sum(closes[-50:]) / 50
@@ -272,6 +323,9 @@ def analyze_market(h1, m15):
 
     atr = calculate_atr(m15)
 
+    if atr is None:
+        return None, "ATR unavailable"
+
     return {
         "trend": trend,
         "atr": atr,
@@ -280,93 +334,95 @@ def analyze_market(h1, m15):
         "m15_time": m15[-1]["time"],
         "h1_count": len(h1),
         "m15_count": len(m15)
-    }
+    }, None
 
 
 # =====================================
-# MAIN SCANNER
+# EURUSD MARKET SCANNER
 # =====================================
 
 async def scan_market(account, connection):
 
-    logger.info("Starting market scan")
+    logger.info("Starting EURUSD scan")
 
-    resolved = await resolve_symbols(connection)
+    symbol = await resolve_eurusd(connection)
 
-    report = [
-        "WIZZY MARKET SCANNER",
-        "",
-        f"UTC: {datetime.now(timezone.utc):%Y-%m-%d %H:%M}",
-        f"Symbols found: {len(resolved)}/{len(SYMBOLS)}",
-        ""
-    ]
+    logger.info("Resolved symbol: %s", symbol)
 
-    for wanted, symbol in resolved.items():
+    # Request only 60 candles per timeframe.
+    # This is a diagnostic test, not a guarantee
+    # that MetaApi historical requests will work.
 
-        try:
+    logger.info("Requesting H1 candles...")
 
-            logger.info("Scanning %s", symbol)
+    raw_h1 = await asyncio.wait_for(
+        account.get_historical_candles(
+            symbol,
+            "1h",
+            None,
+            CANDLE_LIMIT
+        ),
+        timeout=90
+    )
 
-            raw_h1 = await account.get_historical_candles(
-                symbol,
-                "1h",
-                None,
-                120
-            )
+    logger.info("Requesting M15 candles...")
 
-            raw_m15 = await account.get_historical_candles(
-                symbol,
-                "15m",
-                None,
-                120
-            )
+    raw_m15 = await asyncio.wait_for(
+        account.get_historical_candles(
+            symbol,
+            "15m",
+            None,
+            CANDLE_LIMIT
+        ),
+        timeout=90
+    )
 
-            h1 = clean_candles(raw_h1)
-            m15 = clean_candles(raw_m15)
+    h1 = clean_candles(raw_h1, 60)
+    m15 = clean_candles(raw_m15, 15)
 
-            result = analyze_market(h1, m15)
+    result, error = analyze_market(h1, m15)
 
-            if result is None:
+    if error:
 
-                report.append(
-                    f"{wanted}: INSUFFICIENT CANDLES"
-                )
+        return (
+            "WIZZY EURUSD SCANNER\n\n"
+            f"Symbol: {symbol}\n"
+            f"Status: {error}\n"
+            f"H1 candles: {len(h1)}\n"
+            f"M15 candles: {len(m15)}"
+        )
 
-                continue
+    now = datetime.now(timezone.utc)
 
-            age = (
-                datetime.now(timezone.utc)
-                - result["m15_time"]
-            ).total_seconds() / 60
+    # Age since the latest candle CLOSED.
+    latest_close = (
+        result["m15_time"] +
+        timedelta(minutes=15)
+    )
 
-            status = (
-                "CURRENT"
-                if age <= 45
-                else "STALE"
-            )
+    age_minutes = (
+        now - latest_close
+    ).total_seconds() / 60
 
-            report.append(
-                f"{symbol}\n"
-                f"Trend: {result['trend']}\n"
-                f"Price: {result['price']:.5f}\n"
-                f"ATR M15: {result['atr']:.5f}\n"
-                f"Candles: H1={result['h1_count']} "
-                f"M15={result['m15_count']}\n"
-                f"Data: {status} ({age:.0f}m)\n"
-            )
+    if age_minutes <= 30:
+        data_status = "CURRENT"
+    else:
+        data_status = "STALE"
 
-        except Exception as error:
-
-            logger.exception(
-                "Scanner error for %s",
-                symbol
-            )
-
-            report.append(
-                f"{symbol}: ERROR {str(error)[:100]}"
-            )
-
-    return "\n".join(report)
+    return (
+        "WIZZY EURUSD SCANNER\n\n"
+        f"UTC: {now:%Y-%m-%d %H:%M}\n"
+        f"Symbol: {symbol}\n\n"
+        f"Trend H1: {result['trend']}\n"
+        f"Price M15: {result['price']:.5f}\n"
+        f"ATR M15: {result['atr']:.5f}\n\n"
+        f"H1 candles: {result['h1_count']}\n"
+        f"M15 candles: {result['m15_count']}\n"
+        f"Data: {data_status}\n"
+        f"Last closed candle age: "
+        f"{age_minutes:.0f} minutes\n\n"
+        "Trading: DISABLED"
+    )
 
 
 # =====================================
@@ -375,9 +431,23 @@ async def scan_market(account, connection):
 
 async def main():
 
+    if not all([
+        METAAPI_TOKEN,
+        ACCOUNT_ID,
+        TELEGRAM_TOKEN,
+        CHAT_ID
+    ]):
+
+        logger.error(
+            "Missing required Railway variables"
+        )
+
+        return
+
     await send_message(
-        "WIZZY BOT STAGE 2 STARTING\n"
-        "Connecting to MetaApi..."
+        "WIZZY BOT STAGE 2.1 STARTING\n\n"
+        "Testing EURUSD historical market data.\n"
+        "Automatic trading is disabled."
     )
 
     while True:
@@ -388,20 +458,48 @@ async def main():
 
             account, connection = await connect_account()
 
-            result = await scan_market(
+            # Confirm the account remains accessible.
+            info = await connection.get_account_information()
+
+            balance = get_value(info, "balance")
+
+            logger.info(
+                "Account balance: %s",
+                balance
+            )
+
+            report = await scan_market(
                 account,
                 connection
             )
 
-            await send_message(result)
+            await send_message(report)
+
+        except asyncio.TimeoutError:
+
+            logger.exception(
+                "Market data request timed out"
+            )
+
+            await send_message(
+                "WIZZY STAGE 2.1\n\n"
+                "ERROR: Historical market data timed out.\n"
+                "MetaApi did not return candles within "
+                "the configured timeout.\n\n"
+                "Trading remains disabled."
+            )
 
         except Exception as error:
 
-            logger.exception("Main loop error")
+            logger.exception(
+                "Stage 2.1 scan failed"
+            )
 
             await send_message(
-                "WIZZY STAGE 2 ERROR\n"
-                f"{type(error).__name__}: {str(error)[:300]}"
+                "WIZZY STAGE 2.1 ERROR\n\n"
+                f"{type(error).__name__}\n"
+                f"{str(error)[:350]}\n\n"
+                "Trading remains disabled."
             )
 
         finally:
@@ -411,9 +509,10 @@ async def main():
                 try:
                     await connection.close()
 
-                except Exception:
-                    logger.exception(
-                        "Connection close error"
+                except Exception as error:
+                    logger.warning(
+                        "Connection cleanup error: %s",
+                        error
                     )
 
         await asyncio.sleep(SCAN_INTERVAL)
@@ -424,5 +523,4 @@ async def main():
 # =====================================
 
 if __name__ == "__main__":
-
     asyncio.run(main())
