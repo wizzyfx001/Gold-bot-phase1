@@ -1062,5 +1062,291 @@ async def run_scan(bot):
 
                         continue
 
+                                        # ==================================
+                    # AUTOMATIC DEMO ORDER EXECUTION
                     # ==================================
+
+                    try:
+
+                        options = {
+                            "comment": MAGIC_TAG,
+                            "clientId": (
+                                "WZ_"
+                                + symbol
+                                + "_"
+                                + m15[-1]["time"].strftime("%m%d%H%M")
+                            )[:32]
+                        }
+
+                        if direction == "BUY":
+
+                            order_result = await conn.create_market_buy_order(
+                                symbol,
+                                lot,
+                                sl,
+                                tp,
+                                options
+                            )
+
+                        else:
+
+                            order_result = await conn.create_market_sell_order(
+                                symbol,
+                                lot,
+                                sl,
+                                tp,
+                                options
+                            )
+
+                        lines.append(
+                            f"DEMO ORDER RESPONSE: {str(order_result)[:160]}"
+                        )
+
+                        await notify(
+                            bot,
+                            f"DEMO ORDER RESPONSE\n"
+                            f"{setup_message}\n\n"
+                            f"{str(order_result)[:300]}"
+                        )
+
+                        trading_enabled = False
+
+                    except Exception as error:
+
+                        uncertain = True
+
+                        unresolved_orders.append(
+                            f"{symbol}: {error}"
+                        )
+
+                        lines.append(
+                            f"ORDER STATUS UNCERTAIN: {str(error)[:90]}"
+                        )
+
+                        await notify(
+                            bot,
+                            "ORDER STATUS UNCERTAIN.\n"
+                            "Trading locked.\n"
+                            "Inspect MT5 positions and history."
+                        )
+
+                except Exception as error:
+
+                    log.exception(
+                        "Symbol error: %s",
+                        symbol
+                    )
+
+                    lines.append(
+                        f"{symbol}: {str(error)[:90]}"
+                    )
+
+            last_report = "\n".join(lines)
+
+            log.info(last_report)
+
+        except Exception as error:
+
+            last_report = f"SCAN FAILED: {error}"
+
+            log.exception("Main scanner error")
+
+            await notify(
+                bot,
+                last_report
+            )
+
+
+# ==========================================
+# AUTOMATIC SCANNING LOOP
+# ==========================================
+
+async def scanning_loop(bot):
+
+    while True:
+
+        await run_scan(bot)
+
+        await asyncio.sleep(SCAN_SECONDS)
+
+
+# ==========================================
+# TELEGRAM CONTROL PANEL
+# ==========================================
+
+def keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "Status",
+                callback_data="status"
+            ),
+            InlineKeyboardButton(
+                "Scan Now",
+                callback_data="scan"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "Pause Entries",
+                callback_data="pause"
+            ),
+            InlineKeyboardButton(
+                "Resume Entries",
+                callback_data="resume"
+            )
+        ]
+    ])
+
+
+# ==========================================
+# TELEGRAM AUTHORIZATION
+# ==========================================
+
+async def authorized(update):
+
+    chat = (
+        str(update.effective_chat.id)
+        if update.effective_chat
+        else ""
+    )
+
+    if chat != CHAT_ID:
+
+        if update.callback_query:
+
+            await update.callback_query.answer(
+                "Unauthorized",
+                show_alert=True
+            )
+
+        return False
+
+    return True
+
+
+# ==========================================
+# TELEGRAM START COMMAND
+# ==========================================
+
+async def start(update, context):
+
+    if not await authorized(update):
+        return
+
+    await update.message.reply_text(
+        "WIZZY AUTONOMOUS DEMO BOT\n\n"
+        + last_report,
+        reply_markup=keyboard()
+    )
+
+
+# ==========================================
+# TELEGRAM BUTTON HANDLER
+# ==========================================
+
+async def button(update, context):
+
+    global paused
+
+    if not await authorized(update):
+        return
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.data == "pause":
+
+        paused = True
+
+    elif query.data == "resume":
+
+        paused = False
+
+    elif query.data == "scan":
+
+        await run_scan(context.bot)
+
+    await query.message.reply_text(
+        f"Paused: {paused}\n"
+        f"Demo authorized: "
+        f"{ENABLE_DEMO_TRADING and DEMO_CONFIRMED}\n\n"
+        + last_report,
+        reply_markup=keyboard()
+    )
+
+
+# ==========================================
+# MAIN APPLICATION
+# ==========================================
+
+async def main():
+
+    await connect_metaapi()
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button
+        )
+    )
+
+    await app.initialize()
+
+    await app.start()
+
+    await app.updater.start_polling()
+
+    await notify(
+        app.bot,
+        "WIZZY AUTONOMOUS DEMO BOT STARTED\n\n"
+        f"Automatic demo execution: "
+        f"{ENABLE_DEMO_TRADING and DEMO_CONFIRMED}\n"
+        f"Symbols: {', '.join(SYMBOLS)}\n"
+        f"Risk budget: ${RISK_USD}\n"
+        f"Maximum open positions: {MAX_OPEN_POSITIONS}\n"
+        f"Scan interval: {SCAN_SECONDS}s\n\n"
+        "Waiting for valid trading opportunities."
+    )
+
+    task = asyncio.create_task(
+        scanning_loop(app.bot)
+    )
+
+    try:
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        task.cancel()
+
+        await app.updater.stop()
+
+        await app.stop()
+
+        await app.shutdown()
+
+        if conn:
+
+            await conn.close()
+
+
+if __name__ == "__main__":
+
+    asyncio.run(main())
                  
