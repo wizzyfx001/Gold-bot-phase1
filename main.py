@@ -1,26 +1,25 @@
 """
 WIZZY AUTONOMOUS TRADING BOT
-STAGE 2.1 - EURUSD MARKET DATA TEST
+
+STAGE 2.2 - LIVE PRICE STREAMING
 
 Platform:
-GitHub + Railway + MetaApi + MT5 + Telegram
+GitHub + Railway + MetaApi G2 + MT5 + Telegram
 
-Purpose:
-- Connect to MetaApi
-- Verify MT5 account connection
-- Find EURUSD broker symbol
-- Retrieve H1 and M15 candles
-- Calculate ATR and market trend
-- Send Telegram reports
+Features:
+- Persistent MetaApi streaming connection
+- EURUSD live price monitoring
+- Bid, ask and spread reporting
+- Telegram notifications
+- Automatic reconnection
 
-IMPORTANT:
-No trade execution.
+TRADING IS DISABLED.
 """
 
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from metaapi_cloud_sdk import MetaApi
 from telegram import Bot
@@ -36,10 +35,10 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ["EURUSD"]
+SYMBOL = "EURUSD"
 
-SCAN_INTERVAL = 300
-CANDLE_LIMIT = 60
+REPORT_INTERVAL = 60
+RECONNECT_DELAY = 30
 
 
 # =====================================
@@ -53,7 +52,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("WIZZY")
 
-# Reduce noisy MetaApi websocket logs.
 logging.getLogger("socketio").setLevel(logging.WARNING)
 logging.getLogger("engineio").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -72,26 +70,41 @@ async def send_message(message):
         return
 
     try:
+
         async with Bot(token=TELEGRAM_TOKEN) as bot:
+
             await bot.send_message(
                 chat_id=CHAT_ID,
                 text=message[:3900]
             )
 
     except Exception as error:
+
         logger.error(
-            "Telegram notification failed: %s",
+            "Telegram error: %s",
             error
         )
+
+
+# =====================================
+# DATA HELPER
+# =====================================
+
+def get_value(obj, key, default=None):
+
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+
+    return getattr(obj, key, default)
 
 
 # =====================================
 # METAAPI CONNECTION
 # =====================================
 
-async def connect_account():
+async def connect_stream():
 
-    logger.info("Connecting to MetaApi...")
+    logger.info("Connecting to MetaApi G2...")
 
     api = MetaApi(METAAPI_TOKEN)
 
@@ -103,326 +116,147 @@ async def connect_account():
 
     if account.state != "DEPLOYED":
 
-        logger.info("Deploying MetaApi account...")
+        logger.info("Deploying account...")
 
         await account.deploy()
         await account.wait_deployed()
 
+    logger.info("Waiting for broker connection...")
+
     await account.wait_connected()
 
-    connection = account.get_rpc_connection()
+    connection = account.get_streaming_connection()
 
     await connection.connect()
+
+    logger.info("Waiting for synchronization...")
+
     await connection.wait_synchronized()
 
-    logger.info("MetaApi connection established")
+    logger.info("Streaming connection synchronized")
 
-    return account, connection
+    return connection
 
 
 # =====================================
-# DATA HELPERS
+# LIVE PRICE MONITOR
 # =====================================
 
-def get_value(obj, key):
+async def monitor_prices(connection):
 
-    if isinstance(obj, dict):
-        return obj.get(key)
+    state = connection.terminal_state
 
-    return getattr(obj, key, None)
+    logger.info("Subscribing to EURUSD quotes...")
 
+    # MT5 G2 supports quote streaming.
+    # Do not request extended candle subscriptions.
 
-def parse_time(raw):
-
-    if isinstance(raw, datetime):
-        result = raw
-
-    elif isinstance(raw, str):
-
-        try:
-            result = datetime.fromisoformat(
-                raw.replace("Z", "+00:00")
-            )
-
-        except ValueError:
-            return None
-
-    else:
-        return None
-
-    if result.tzinfo is None:
-        result = result.replace(
-            tzinfo=timezone.utc
-        )
-
-    return result.astimezone(timezone.utc)
-
-
-def clean_candles(raw, timeframe_minutes):
-
-    now = datetime.now(timezone.utc)
-
-    candles = []
-
-    for candle in raw:
-
-        try:
-
-            timestamp = parse_time(
-                get_value(candle, "time")
-            )
-
-            if timestamp is None:
-                continue
-
-            o = float(get_value(candle, "open"))
-            h = float(get_value(candle, "high"))
-            l = float(get_value(candle, "low"))
-            c = float(get_value(candle, "close"))
-
-            if not (
-                l <= min(o, c)
-                and max(o, c) <= h
-            ):
-                continue
-
-            # Ignore unfinished candles.
-            close_time = timestamp + timedelta(
-                minutes=timeframe_minutes
-            )
-
-            if close_time > now:
-                continue
-
-            candles.append({
-                "time": timestamp,
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c
-            })
-
-        except (TypeError, ValueError):
-            continue
-
-    candles.sort(
-        key=lambda item: item["time"]
+    await connection.subscribe_to_market_data(
+        SYMBOL
     )
 
-    return candles
-
-
-# =====================================
-# ATR CALCULATION
-# =====================================
-
-def calculate_atr(candles, period=14):
-
-    if len(candles) < period + 1:
-        return None
-
-    ranges = []
-
-    for index in range(1, len(candles)):
-
-        current = candles[index]
-        previous = candles[index - 1]
-
-        true_range = max(
-            current["high"] - current["low"],
-            abs(
-                current["high"] -
-                previous["close"]
-            ),
-            abs(
-                current["low"] -
-                previous["close"]
-            )
-        )
-
-        ranges.append(true_range)
-
-    return sum(
-        ranges[-period:]
-    ) / period
-
-
-# =====================================
-# SYMBOL RESOLVER
-# =====================================
-
-async def resolve_eurusd(connection):
-
-    available = await connection.get_symbols()
-
-    names = [
-        str(symbol)
-        for symbol in available
-    ]
-
-    exact = [
-        symbol
-        for symbol in names
-        if symbol.upper() == "EURUSD"
-    ]
-
-    if exact:
-        return exact[0]
-
-    matches = [
-        symbol
-        for symbol in names
-        if (
-            symbol.upper().startswith("EURUSD")
-            and len(symbol) <= 10
-        )
-    ]
-
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        raise RuntimeError(
-            "Multiple EURUSD symbol matches: "
-            + ", ".join(matches)
-        )
-
-    raise RuntimeError(
-        "EURUSD symbol not found on broker"
-    )
-
-
-# =====================================
-# MARKET ANALYSIS
-# =====================================
-
-def analyze_market(h1, m15):
-
-    if len(h1) < 50:
-        return None, "Insufficient H1 candles"
-
-    if len(m15) < 20:
-        return None, "Insufficient M15 candles"
-
-    closes = [
-        candle["close"]
-        for candle in h1
-    ]
-
-    sma20 = sum(closes[-20:]) / 20
-    sma50 = sum(closes[-50:]) / 50
-
-    if sma20 > sma50:
-        trend = "UP"
-
-    elif sma20 < sma50:
-        trend = "DOWN"
-
-    else:
-        trend = "RANGE"
-
-    atr = calculate_atr(m15)
-
-    if atr is None:
-        return None, "ATR unavailable"
-
-    return {
-        "trend": trend,
-        "atr": atr,
-        "price": m15[-1]["close"],
-        "h1_time": h1[-1]["time"],
-        "m15_time": m15[-1]["time"],
-        "h1_count": len(h1),
-        "m15_count": len(m15)
-    }, None
-
-
-# =====================================
-# EURUSD MARKET SCANNER
-# =====================================
-
-async def scan_market(account, connection):
-
-    logger.info("Starting EURUSD scan")
-
-    symbol = await resolve_eurusd(connection)
-
-    logger.info("Resolved symbol: %s", symbol)
-
-    # Request only 60 candles per timeframe.
-    # This is a diagnostic test, not a guarantee
-    # that MetaApi historical requests will work.
-
-    logger.info("Requesting H1 candles...")
-
-    raw_h1 = await asyncio.wait_for(
-        account.get_historical_candles(
-            symbol,
-            "1h",
-            None,
-            CANDLE_LIMIT
-        ),
-        timeout=90
-    )
-
-    logger.info("Requesting M15 candles...")
-
-    raw_m15 = await asyncio.wait_for(
-        account.get_historical_candles(
-            symbol,
-            "15m",
-            None,
-            CANDLE_LIMIT
-        ),
-        timeout=90
-    )
-
-    h1 = clean_candles(raw_h1, 60)
-    m15 = clean_candles(raw_m15, 15)
-
-    result, error = analyze_market(h1, m15)
-
-    if error:
-
-        return (
-            "WIZZY EURUSD SCANNER\n\n"
-            f"Symbol: {symbol}\n"
-            f"Status: {error}\n"
-            f"H1 candles: {len(h1)}\n"
-            f"M15 candles: {len(m15)}"
-        )
-
-    now = datetime.now(timezone.utc)
-
-    # Age since the latest candle CLOSED.
-    latest_close = (
-        result["m15_time"] +
-        timedelta(minutes=15)
-    )
-
-    age_minutes = (
-        now - latest_close
-    ).total_seconds() / 60
-
-    if age_minutes <= 30:
-        data_status = "CURRENT"
-    else:
-        data_status = "STALE"
-
-    return (
-        "WIZZY EURUSD SCANNER\n\n"
-        f"UTC: {now:%Y-%m-%d %H:%M}\n"
-        f"Symbol: {symbol}\n\n"
-        f"Trend H1: {result['trend']}\n"
-        f"Price M15: {result['price']:.5f}\n"
-        f"ATR M15: {result['atr']:.5f}\n\n"
-        f"H1 candles: {result['h1_count']}\n"
-        f"M15 candles: {result['m15_count']}\n"
-        f"Data: {data_status}\n"
-        f"Last closed candle age: "
-        f"{age_minutes:.0f} minutes\n\n"
+    await send_message(
+        "WIZZY LIVE SCANNER\n\n"
+        "Streaming connection established.\n"
+        f"Symbol: {SYMBOL}\n"
+        "Waiting for live quotes...\n\n"
         "Trading: DISABLED"
     )
+
+    while True:
+
+        try:
+
+            connected = get_value(
+                state,
+                "connected_to_broker",
+                False
+            )
+
+            if not connected:
+
+                await send_message(
+                    "WIZZY CONNECTION WARNING\n\n"
+                    "Broker connection is unavailable.\n"
+                    "Attempting reconnection."
+                )
+
+                return
+
+            price = state.price(SYMBOL)
+
+            if price is None:
+
+                logger.warning(
+                    "No price available for %s",
+                    SYMBOL
+                )
+
+                await asyncio.sleep(REPORT_INTERVAL)
+                continue
+
+            bid = get_value(price, "bid")
+            ask = get_value(price, "ask")
+
+            if bid is None or ask is None:
+
+                logger.warning("Incomplete price data")
+
+                await asyncio.sleep(REPORT_INTERVAL)
+                continue
+
+            bid = float(bid)
+            ask = float(ask)
+
+            if bid <= 0 or ask <= bid:
+
+                logger.warning("Invalid quote received")
+
+                await asyncio.sleep(REPORT_INTERVAL)
+                continue
+
+            spread = ask - bid
+
+            # EURUSD pip size.
+            pip_size = 0.0001
+
+            spread_pips = spread / pip_size
+
+            now = datetime.now(timezone.utc)
+
+            quote_time = get_value(
+                price,
+                "time",
+                "Unavailable"
+            )
+
+            report = (
+                "WIZZY LIVE MARKET SCANNER\n\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Bid: {bid:.5f}\n"
+                f"Ask: {ask:.5f}\n"
+                f"Spread: {spread_pips:.2f} pips\n\n"
+                f"Quote time: {quote_time}\n"
+                f"Report UTC: {now:%Y-%m-%d %H:%M:%S}\n\n"
+                "Connection: STREAMING\n"
+                "Trading: DISABLED"
+            )
+
+            await send_message(report)
+
+        except Exception as error:
+
+            logger.exception("Price monitoring error")
+
+            await send_message(
+                "WIZZY PRICE ERROR\n\n"
+                f"{type(error).__name__}: "
+                f"{str(error)[:250]}"
+            )
+
+            return
+
+        await asyncio.sleep(REPORT_INTERVAL)
 
 
 # =====================================
@@ -439,15 +273,16 @@ async def main():
     ]):
 
         logger.error(
-            "Missing required Railway variables"
+            "Missing Railway environment variables"
         )
 
         return
 
     await send_message(
-        "WIZZY BOT STAGE 2.1 STARTING\n\n"
-        "Testing EURUSD historical market data.\n"
-        "Automatic trading is disabled."
+        "WIZZY BOT STAGE 2.2 STARTING\n\n"
+        "Testing MetaApi G2 live price streaming.\n"
+        "Symbol: EURUSD\n"
+        "Trading: DISABLED"
     )
 
     while True:
@@ -456,50 +291,21 @@ async def main():
 
         try:
 
-            account, connection = await connect_account()
+            connection = await connect_stream()
 
-            # Confirm the account remains accessible.
-            info = await connection.get_account_information()
-
-            balance = get_value(info, "balance")
-
-            logger.info(
-                "Account balance: %s",
-                balance
-            )
-
-            report = await scan_market(
-                account,
-                connection
-            )
-
-            await send_message(report)
-
-        except asyncio.TimeoutError:
-
-            logger.exception(
-                "Market data request timed out"
-            )
-
-            await send_message(
-                "WIZZY STAGE 2.1\n\n"
-                "ERROR: Historical market data timed out.\n"
-                "MetaApi did not return candles within "
-                "the configured timeout.\n\n"
-                "Trading remains disabled."
-            )
+            await monitor_prices(connection)
 
         except Exception as error:
 
             logger.exception(
-                "Stage 2.1 scan failed"
+                "Streaming connection error"
             )
 
             await send_message(
-                "WIZZY STAGE 2.1 ERROR\n\n"
+                "WIZZY STREAMING ERROR\n\n"
                 f"{type(error).__name__}\n"
                 f"{str(error)[:350]}\n\n"
-                "Trading remains disabled."
+                "Reconnection will be attempted."
             )
 
         finally:
@@ -510,12 +316,18 @@ async def main():
                     await connection.close()
 
                 except Exception as error:
+
                     logger.warning(
                         "Connection cleanup error: %s",
                         error
                     )
 
-        await asyncio.sleep(SCAN_INTERVAL)
+        logger.info(
+            "Reconnecting in %s seconds",
+            RECONNECT_DELAY
+        )
+
+        await asyncio.sleep(RECONNECT_DELAY)
 
 
 # =====================================
@@ -523,4 +335,5 @@ async def main():
 # =====================================
 
 if __name__ == "__main__":
+
     asyncio.run(main())
