@@ -1,19 +1,21 @@
 """
 WIZZY AUTONOMOUS TRADING BOT
+STAGE 2.3 - MULTI-SYMBOL LIVE MARKET SCANNER
 
-STAGE 2.2 - LIVE PRICE STREAMING
-
-Platform:
-GitHub + Railway + MetaApi G2 + MT5 + Telegram
+GitHub -> Railway -> MetaApi G2 -> Headway MT5 Demo -> Telegram
 
 Features:
 - Persistent MetaApi streaming connection
-- EURUSD live price monitoring
-- Bid, ask and spread reporting
-- Telegram notifications
-- Automatic reconnection
+- Five forex/gold instruments
+- Automatic broker symbol detection
+- Live bid/ask prices
+- Spread calculation
+- Stale quote detection
+- Combined Telegram report every 5 minutes
+- Connection monitoring and automatic reconnection
 
-TRADING IS DISABLED.
+IMPORTANT:
+AUTOMATIC TRADING IS DISABLED.
 """
 
 import os
@@ -25,9 +27,9 @@ from metaapi_cloud_sdk import MetaApi
 from telegram import Bot
 
 
-# =====================================
+# ==========================================
 # CONFIGURATION
-# =====================================
+# ==========================================
 
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
@@ -35,15 +37,24 @@ ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "EURUSD"
+SYMBOLS = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "XAUUSD"
+]
 
-REPORT_INTERVAL = 60
+REPORT_INTERVAL = 300
 RECONNECT_DELAY = 30
 
+MAX_QUOTE_AGE = 180
+STARTUP_QUOTE_WAIT = 30
 
-# =====================================
+
+# ==========================================
 # LOGGING
-# =====================================
+# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,9 +68,9 @@ logging.getLogger("engineio").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# =====================================
+# ==========================================
 # TELEGRAM
-# =====================================
+# ==========================================
 
 async def send_message(message):
 
@@ -86,9 +97,9 @@ async def send_message(message):
         )
 
 
-# =====================================
-# DATA HELPER
-# =====================================
+# ==========================================
+# HELPERS
+# ==========================================
 
 def get_value(obj, key, default=None):
 
@@ -98,9 +109,134 @@ def get_value(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-# =====================================
+def parse_time(value):
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+
+        return value.astimezone(timezone.utc)
+
+    if isinstance(value, (int, float)):
+
+        try:
+            return datetime.fromtimestamp(
+                value,
+                tz=timezone.utc
+            )
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+
+        try:
+
+            return datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+
+        except Exception:
+            return None
+
+    return None
+
+
+def pip_size_for(symbol):
+
+    if symbol.startswith("XAUUSD"):
+        return 0.01
+
+    if symbol.startswith("USDJPY"):
+        return 0.01
+
+    return 0.0001
+
+
+def price_digits_for(symbol):
+
+    if symbol.startswith("XAUUSD"):
+        return 2
+
+    if symbol.startswith("USDJPY"):
+        return 3
+
+    return 5
+
+
+# ==========================================
+# SYMBOL DETECTION
+# ==========================================
+
+def resolve_symbols(available_symbols):
+
+    """
+    Resolve broker-specific names.
+
+    Examples:
+    EURUSD
+    EURUSDm
+    EURUSD.a
+    XAUUSD
+    XAUUSDm
+    """
+
+    available = [
+        str(symbol)
+        for symbol in available_symbols
+    ]
+
+    resolved = {}
+    missing = []
+
+    for requested in SYMBOLS:
+
+        # Prefer exact matches.
+        exact = next(
+            (
+                symbol
+                for symbol in available
+                if symbol.upper() == requested
+            ),
+            None
+        )
+
+        if exact:
+
+            resolved[requested] = exact
+            continue
+
+        # Otherwise allow broker suffixes.
+        matches = [
+            symbol
+            for symbol in available
+            if symbol.upper().startswith(requested)
+        ]
+
+        if matches:
+
+            matches.sort(
+                key=lambda symbol: (
+                    len(symbol),
+                    symbol
+                )
+            )
+
+            resolved[requested] = matches[0]
+
+        else:
+
+            missing.append(requested)
+
+    return resolved, missing
+
+
+# ==========================================
 # METAAPI CONNECTION
-# =====================================
+# ==========================================
 
 async def connect_stream():
 
@@ -121,15 +257,11 @@ async def connect_stream():
         await account.deploy()
         await account.wait_deployed()
 
-    logger.info("Waiting for broker connection...")
-
     await account.wait_connected()
 
     connection = account.get_streaming_connection()
 
     await connection.connect()
-
-    logger.info("Waiting for synchronization...")
 
     await connection.wait_synchronized()
 
@@ -138,61 +270,82 @@ async def connect_stream():
     return connection
 
 
-# =====================================
-# LIVE PRICE MONITOR
-# =====================================
+# ==========================================
+# SUBSCRIPTIONS
+# ==========================================
 
-async def monitor_prices(connection):
+async def subscribe_symbols(connection, resolved):
 
-    state = connection.terminal_state
+    successful = {}
+    failed = {}
 
-    logger.info("Subscribing to EURUSD quotes...")
-
-    # MT5 G2 supports quote streaming.
-    # Do not request extended candle subscriptions.
-
-    await connection.subscribe_to_market_data(
-        SYMBOL
-    )
-
-    await send_message(
-        "WIZZY LIVE SCANNER\n\n"
-        "Streaming connection established.\n"
-        f"Symbol: {SYMBOL}\n"
-        "Waiting for live quotes...\n\n"
-        "Trading: DISABLED"
-    )
-
-    while True:
+    for requested, broker_symbol in resolved.items():
 
         try:
 
-            connected = get_value(
-                state,
-                "connected_to_broker",
-                False
+            logger.info(
+                "Subscribing to %s",
+                broker_symbol
             )
 
-            if not connected:
+            await connection.subscribe_to_market_data(
+                broker_symbol
+            )
 
-                await send_message(
-                    "WIZZY CONNECTION WARNING\n\n"
-                    "Broker connection is unavailable.\n"
-                    "Attempting reconnection."
-                )
+            successful[requested] = broker_symbol
 
-                return
+        except Exception as error:
 
-            price = state.price(SYMBOL)
+            failed[requested] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+            logger.warning(
+                "Subscription failed for %s: %s",
+                broker_symbol,
+                error
+            )
+
+    return successful, failed
+
+
+# ==========================================
+# MARKET REPORT
+# ==========================================
+
+def build_market_report(connection, subscriptions):
+
+    state = connection.terminal_state
+
+    now = datetime.now(timezone.utc)
+
+    lines = [
+        "WIZZY LIVE MARKET SCANNER",
+        "",
+        f"UTC: {now:%Y-%m-%d %H:%M:%S}",
+        ""
+    ]
+
+    fresh_count = 0
+    stale_count = 0
+    missing_count = 0
+
+    for requested, broker_symbol in subscriptions.items():
+
+        lines.append(
+            f"{requested} ({broker_symbol})"
+        )
+
+        try:
+
+            price = state.price(broker_symbol)
 
             if price is None:
 
-                logger.warning(
-                    "No price available for %s",
-                    SYMBOL
-                )
+                lines.append("Status: WAITING FOR QUOTES")
+                lines.append("")
 
-                await asyncio.sleep(REPORT_INTERVAL)
+                missing_count += 1
                 continue
 
             bid = get_value(price, "bid")
@@ -200,68 +353,133 @@ async def monitor_prices(connection):
 
             if bid is None or ask is None:
 
-                logger.warning("Incomplete price data")
+                lines.append("Status: INCOMPLETE QUOTE")
+                lines.append("")
 
-                await asyncio.sleep(REPORT_INTERVAL)
+                missing_count += 1
                 continue
 
             bid = float(bid)
             ask = float(ask)
 
-            if bid <= 0 or ask <= bid:
+            if bid <= 0 or ask < bid:
 
-                logger.warning("Invalid quote received")
+                lines.append("Status: INVALID QUOTE")
+                lines.append("")
 
-                await asyncio.sleep(REPORT_INTERVAL)
+                missing_count += 1
                 continue
 
-            spread = ask - bid
+            pip_size = pip_size_for(requested)
+            digits = price_digits_for(requested)
 
-            # EURUSD pip size.
-            pip_size = 0.0001
+            spread = (ask - bid) / pip_size
 
-            spread_pips = spread / pip_size
-
-            now = datetime.now(timezone.utc)
-
-            quote_time = get_value(
-                price,
-                "time",
-                "Unavailable"
+            quote_time = parse_time(
+                get_value(price, "time")
             )
 
-            report = (
-                "WIZZY LIVE MARKET SCANNER\n\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Bid: {bid:.5f}\n"
-                f"Ask: {ask:.5f}\n"
-                f"Spread: {spread_pips:.2f} pips\n\n"
-                f"Quote time: {quote_time}\n"
-                f"Report UTC: {now:%Y-%m-%d %H:%M:%S}\n\n"
-                "Connection: STREAMING\n"
-                "Trading: DISABLED"
-            )
+            if quote_time is None:
 
-            await send_message(report)
+                status = "QUOTE TIME UNKNOWN"
+                missing_count += 1
+
+            else:
+
+                age = max(
+                    0,
+                    (now - quote_time).total_seconds()
+                )
+
+                if age > MAX_QUOTE_AGE:
+
+                    status = f"STALE ({int(age)}s old)"
+                    stale_count += 1
+
+                else:
+
+                    status = "LIVE"
+                    fresh_count += 1
+
+            lines.extend([
+                f"Bid: {bid:.{digits}f}",
+                f"Ask: {ask:.{digits}f}",
+                f"Spread: {spread:.2f} "
+                + (
+                    "price units of $0.01"
+                    if requested == "XAUUSD"
+                    else "pips"
+                ),
+                f"Status: {status}",
+                ""
+            ])
 
         except Exception as error:
 
-            logger.exception("Price monitoring error")
+            missing_count += 1
 
-            await send_message(
-                "WIZZY PRICE ERROR\n\n"
-                f"{type(error).__name__}: "
-                f"{str(error)[:250]}"
+            lines.extend([
+                f"Status: ERROR ({type(error).__name__})",
+                ""
+            ])
+
+            logger.exception(
+                "Failed to read %s",
+                broker_symbol
             )
 
-            return
+    lines.extend([
+        "------------------------",
+        f"Fresh: {fresh_count}",
+        f"Stale: {stale_count}",
+        f"Unavailable: {missing_count}",
+        "",
+        "Trading: DISABLED"
+    ])
+
+    return "\n".join(lines)
+
+
+# ==========================================
+# MONITOR
+# ==========================================
+
+async def monitor_market(connection, subscriptions):
+
+    state = connection.terminal_state
+
+    logger.info(
+        "Waiting %s seconds for initial quotes...",
+        STARTUP_QUOTE_WAIT
+    )
+
+    await asyncio.sleep(STARTUP_QUOTE_WAIT)
+
+    while True:
+
+        if not get_value(
+            state,
+            "connected_to_broker",
+            False
+        ):
+
+            raise ConnectionError(
+                "Broker streaming connection lost"
+            )
+
+        report = build_market_report(
+            connection,
+            subscriptions
+        )
+
+        await send_message(report)
 
         await asyncio.sleep(REPORT_INTERVAL)
 
 
-# =====================================
-# MAIN LOOP
-# =====================================
+# ==========================================
+# MAIN
+# ==========================================
 
 async def main():
 
@@ -273,15 +491,15 @@ async def main():
     ]):
 
         logger.error(
-            "Missing Railway environment variables"
+            "Missing required Railway variables"
         )
 
         return
 
     await send_message(
-        "WIZZY BOT STAGE 2.2 STARTING\n\n"
-        "Testing MetaApi G2 live price streaming.\n"
-        "Symbol: EURUSD\n"
+        "WIZZY BOT STAGE 2.3 STARTING\n\n"
+        "Multi-symbol live market scanner.\n"
+        "Instruments: 5\n"
         "Trading: DISABLED"
     )
 
@@ -293,19 +511,93 @@ async def main():
 
             connection = await connect_stream()
 
-            await monitor_prices(connection)
+            # MetaApi streaming connection supports
+            # reading available symbols.
+            symbols = await connection.get_symbols()
+
+            resolved, missing = resolve_symbols(
+                symbols
+            )
+
+            if not resolved:
+
+                raise RuntimeError(
+                    "No requested broker symbols found"
+                )
+
+            subscriptions, failed = (
+                await subscribe_symbols(
+                    connection,
+                    resolved
+                )
+            )
+
+            if not subscriptions:
+
+                raise RuntimeError(
+                    "All market subscriptions failed"
+                )
+
+            startup_lines = [
+                "WIZZY STAGE 2.3 CONNECTED",
+                "",
+                "Subscribed symbols:"
+            ]
+
+            for requested, broker_symbol in subscriptions.items():
+
+                startup_lines.append(
+                    f"{requested} -> {broker_symbol}"
+                )
+
+            if missing:
+
+                startup_lines.extend([
+                    "",
+                    "Missing symbols:",
+                    ", ".join(missing)
+                ])
+
+            if failed:
+
+                startup_lines.extend([
+                    "",
+                    "Failed subscriptions:"
+                ])
+
+                for requested, error in failed.items():
+
+                    startup_lines.append(
+                        f"{requested}: {error[:100]}"
+                    )
+
+            startup_lines.extend([
+                "",
+                "Market reports: Every 5 minutes",
+                "Trading: DISABLED"
+            ])
+
+            await send_message(
+                "\n".join(startup_lines)
+            )
+
+            await monitor_market(
+                connection,
+                subscriptions
+            )
 
         except Exception as error:
 
             logger.exception(
-                "Streaming connection error"
+                "Stage 2.3 error"
             )
 
             await send_message(
-                "WIZZY STREAMING ERROR\n\n"
+                "WIZZY STAGE 2.3 ERROR\n\n"
                 f"{type(error).__name__}\n"
                 f"{str(error)[:350]}\n\n"
-                "Reconnection will be attempted."
+                "Retrying in 30 seconds.\n"
+                "Trading: DISABLED"
             )
 
         finally:
@@ -322,17 +614,12 @@ async def main():
                         error
                     )
 
-        logger.info(
-            "Reconnecting in %s seconds",
-            RECONNECT_DELAY
-        )
-
         await asyncio.sleep(RECONNECT_DELAY)
 
 
-# =====================================
-# START
-# =====================================
+# ==========================================
+# ENTRY POINT
+# ==========================================
 
 if __name__ == "__main__":
 
